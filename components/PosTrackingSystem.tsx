@@ -494,10 +494,10 @@ export default function PosTrackingSystem() {
           <div className="bg-white rounded-lg shadow-lg p-6">
             <h3 className="text-lg font-semibold text-gray-800 mb-3">Cara Pakai:</h3>
             <ol className="space-y-2 text-gray-700">
-              <li className="flex gap-3">
+              {/* <li className="flex gap-3">
                 <span className="shrink-0 w-6 h-6 bg-orange-600 text-white rounded-full flex items-center justify-center text-sm font-semibold">1</span>
                 <span>Buat file <code className="bg-gray-100 px-1 rounded">.env.local</code> dan tambah <code className="bg-gray-100 px-1 rounded">NEXT_PUBLIC_BINDERBYTE_API_KEY=13b4f08fd70c238f99183d65781484692d9229ec88c51c1f344ca19618e44428</code></span>
-              </li>
+              </li> */}
               <li className="flex gap-3">
                 <span className="shrink-0 w-6 h-6 bg-orange-600 text-white rounded-full flex items-center justify-center text-sm font-semibold">2</span>
                 <span>Masukkan nomor resi POS Indonesia (format: Pxxxxxxxxxxxxx)</span>
