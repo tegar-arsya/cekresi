@@ -2,7 +2,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Package, Search, Loader2, CheckCircle, XCircle, Clock, Copy, Check, Download, Truck, MapPin, User, Calendar, RefreshCw } from 'lucide-react';
+import { Package, Search, Loader2, CheckCircle, XCircle, Clock, Copy, Check, Download, Truck, MapPin, User, Calendar, RefreshCw, FileText, Users } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 interface TrackingHistory {
@@ -43,6 +43,16 @@ interface ResiItem {
   lastUpdated: string | null;
 }
 
+interface NormalizedData {
+  noResi: string;
+  penerimaResi: string;
+  penerimaPaket: string;
+  statusPenerima: string;
+  kategoriPenerima: string;
+  lokasi: string;
+  tanggal: string;
+}
+
 const API_KEY = process.env.NEXT_PUBLIC_BINDERBYTE_API_KEY;
 
 export default function PosTrackingSystem() {
@@ -50,6 +60,7 @@ export default function PosTrackingSystem() {
   const [resiList, setResiList] = useState<ResiItem[]>([]);
   const [isTracking, setIsTracking] = useState<boolean>(false);
   const [copied, setCopied] = useState<string | null>(null);
+  const [showNormalization, setShowNormalization] = useState<boolean>(false);
 
   const trackResi = async (resi: string): Promise<TrackingData> => {
     if (!API_KEY) {
@@ -71,6 +82,81 @@ export default function PosTrackingSystem() {
     }
     
     return data;
+  };
+
+  // Fungsi untuk mengekstrak informasi penerima paket dari status terakhir
+  const extractReceiverInfo = (historyDesc: string) => {
+    if (!historyDesc) return { penerimaPaket: '', statusPenerima: '', kategoriPenerima: '' };
+
+    // Pattern matching untuk mengekstrak nama penerima dan status
+    const penerimaMatch = historyDesc.match(/diterima oleh\s*\(([^)]+)\)/i);
+    const statusMatch = historyDesc.match(/\(([^)]+)\)\s*$/i);
+
+    const penerimaPaket = penerimaMatch ? penerimaMatch[1].trim() : '';
+    const statusPenerima = statusMatch ? statusMatch[1].trim() : '';
+
+    // Kategorikan status penerima
+    let kategoriPenerima = 'Tidak Diketahui';
+    if (statusPenerima.includes('DITERIMA YANG BERSANGKUTAN')) {
+      kategoriPenerima = 'Penerima Langsung';
+    } else if (statusPenerima.includes('DITERIMA ORANG SERUMAH')) {
+      kategoriPenerima = 'Keluarga/Serumah';
+    } else if (statusPenerima.includes('Keluarga')) {
+      kategoriPenerima = 'Keluarga';
+    } else if (statusPenerima.includes('tetangga') || statusPenerima.includes('sekitar')) {
+      kategoriPenerima = 'Tetangga/Sekitar';
+    } else if (statusPenerima.includes('rekan kerja')) {
+      kategoriPenerima = 'Rekan Kerja';
+    }
+
+    return { penerimaPaket, statusPenerima, kategoriPenerima };
+  };
+
+  // Fungsi untuk mengekstrak lokasi dari deskripsi
+  const extractLocation = (historyDesc: string) => {
+    if (!historyDesc) return '';
+    
+    // Ambil bagian sebelum "Delivered |" atau "On Delivery |"
+    const locationMatch = historyDesc.match(/^([^|]+)/);
+    return locationMatch ? locationMatch[1].trim() : '';
+  };
+
+  // Generate data ternormalisasi
+  const generateNormalizedData = (): NormalizedData[] => {
+    return resiList.map(item => {
+      if (!item.data?.data || item.data.status !== 200) {
+        return {
+          noResi: item.resi,
+          penerimaResi: '-',
+          penerimaPaket: '-',
+          statusPenerima: '-',
+          kategoriPenerima: 'Error',
+          lokasi: '-',
+          tanggal: '-'
+        };
+      }
+
+      const { summary, detail } = item.data.data;
+      const latestHistory = item.data.data.history && item.data.data.history.length > 0 
+        ? item.data.data.history[0] 
+        : null;
+
+      const { penerimaPaket, statusPenerima, kategoriPenerima } = latestHistory 
+        ? extractReceiverInfo(latestHistory.desc)
+        : { penerimaPaket: '', statusPenerima: '', kategoriPenerima: 'Tidak Diketahui' };
+
+      const lokasi = latestHistory ? extractLocation(latestHistory.desc) : '';
+
+      return {
+        noResi: item.resi,
+        penerimaResi: detail.receiver,
+        penerimaPaket: penerimaPaket || detail.receiver, // Fallback ke penerima resi jika tidak ada data
+        statusPenerima: statusPenerima || summary.status,
+        kategoriPenerima: kategoriPenerima,
+        lokasi: lokasi,
+        tanggal: latestHistory?.date || summary.date
+      };
+    });
   };
 
   const processResi = async () => {
@@ -104,6 +190,7 @@ export default function PosTrackingSystem() {
 
     setResiList(newResiList);
     setIsTracking(true);
+    setShowNormalization(false); // Reset normalization view
 
     for (let i = 0; i < newResiList.length; i++) {
       const resi = newResiList[i].resi;
@@ -222,17 +309,42 @@ export default function PosTrackingSystem() {
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Tracking POS');
     
     const colWidths = [
-      { wch: 15 }, { wch: 12 }, { wch: 10 }, { wch: 20 },
-      { wch: 20 }, { wch: 20 }, { wch: 40 }, { wch: 30 },
+      { wch: 15 }, { wch: 25 }, { wch: 60 }, { wch: 30 },
     ];
     worksheet['!cols'] = colWidths;
 
     XLSX.writeFile(workbook, `tracking-pos-${new Date().toISOString().split('T')[0]}.xlsx`);
   };
 
+  const exportNormalizedToExcel = () => {
+    const normalizedData = generateNormalizedData();
+    const data = normalizedData.map(item => ({
+      'No Resi': item.noResi,
+      'Penerima Resi': item.penerimaResi,
+      'Penerima Paket': item.penerimaPaket,
+      'Status Penerima': item.statusPenerima,
+      'Kategori Penerima': item.kategoriPenerima,
+      'Lokasi': item.lokasi,
+      'Tanggal': item.tanggal
+    }));
+
+    const worksheet = XLSX.utils.json_to_sheet(data);
+    const workbook = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(workbook, worksheet, 'Data Ternormalisasi');
+    
+    const colWidths = [
+      { wch: 15 }, { wch: 25 }, { wch: 25 }, { wch: 30 },
+      { wch: 20 }, { wch: 25 }, { wch: 20 }
+    ];
+    worksheet['!cols'] = colWidths;
+
+    XLSX.writeFile(workbook, `data-normalisasi-${new Date().toISOString().split('T')[0]}.xlsx`);
+  };
+
   const clearAll = () => {
     setResiList([]);
     setResiNumbers('');
+    setShowNormalization(false);
   };
 
   const successfulTrackings = resiList.filter(item => item.data?.status === 200).length;
@@ -244,6 +356,8 @@ export default function PosTrackingSystem() {
     }
     return item.data.data.history[0];
   };
+
+  const normalizedData = generateNormalizedData();
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-orange-50 via-white to-red-50">
@@ -322,7 +436,7 @@ export default function PosTrackingSystem() {
         {resiList.length > 0 && (
           <div className="space-y-6">
             {/* Summary Cards */}
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
               <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-blue-500">
                 <div className="flex items-center justify-between">
                   <div>
@@ -358,6 +472,18 @@ export default function PosTrackingSystem() {
                   </div>
                 </div>
               </div>
+
+              <div className="bg-white rounded-xl shadow-lg p-6 border-l-4 border-purple-500">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-sm text-gray-600 mb-1">Ternormalisasi</p>
+                    <p className="text-3xl font-bold text-purple-600">{normalizedData.filter(item => item.kategoriPenerima !== 'Error').length}</p>
+                  </div>
+                  <div className="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center">
+                    <Users className="w-6 h-6 text-purple-600" />
+                  </div>
+                </div>
+              </div>
             </div>
 
             {/* Action Buttons */}
@@ -375,52 +501,140 @@ export default function PosTrackingSystem() {
                 className="px-6 py-3 bg-green-600 hover:bg-green-700 text-white rounded-xl flex items-center gap-2 transition-all shadow-md hover:shadow-lg"
               >
                 <Download className="w-4 h-4" />
-                Export Excel
+                Export Excel Tracking
               </button>
+
+              <button
+                onClick={() => setShowNormalization(!showNormalization)}
+                className={`px-6 py-3 rounded-xl flex items-center gap-2 transition-all shadow-md hover:shadow-lg ${
+                  showNormalization 
+                    ? 'bg-purple-600 hover:bg-purple-700 text-white' 
+                    : 'bg-gray-600 hover:bg-gray-700 text-white'
+                }`}
+              >
+                <FileText className="w-4 h-4" />
+                {showNormalization ? 'Tampilkan Tracking' : 'Tampilkan Normalisasi'}
+              </button>
+
+              {showNormalization && (
+                <button
+                  onClick={exportNormalizedToExcel}
+                  className="px-6 py-3 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl flex items-center gap-2 transition-all shadow-md hover:shadow-lg"
+                >
+                  <Download className="w-4 h-4" />
+                  Export Data Normalisasi
+                </button>
+              )}
             </div>
 
-            {/* Tracking Results */}
-            <div className="space-y-4">
-              {resiList.map((item, index) => (
-                <div key={index} className="bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-100 hover:shadow-xl transition-shadow">
-                  {/* Header */}
-                  <div className="bg-gradient-to-r from-orange-500 to-red-500 px-6 py-4">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-3">
-                        <div className="w-10 h-10 bg-white/20 rounded-lg flex items-center justify-center">
-                          <Truck className="w-5 h-5 text-white" />
-                        </div>
-                        <div>
-                          <p className="text-white/80 text-xs font-medium mb-1">Nomor Resi</p>
-                          <p className="font-mono font-bold text-lg text-white">{item.resi}</p>
-                        </div>
-                      </div>
-                      
-                      <div className="flex items-center gap-2">
-                        <button
-                          onClick={() => copyResi(item.resi)}
-                          className="p-2 bg-white/20 hover:bg-white/30 rounded-lg transition-colors"
-                          title="Copy"
-                        >
-                          {copied === item.resi ? (
-                            <Check className="w-4 h-4 text-white" />
-                          ) : (
-                            <Copy className="w-4 h-4 text-white" />
-                          )}
-                        </button>
-                        <button
-                          onClick={() => trackSingleResi(item.resi)}
-                          disabled={item.loading || !API_KEY}
-                          className="px-4 py-2 bg-white/20 hover:bg-white/30 disabled:bg-white/10 text-white rounded-lg flex items-center gap-2 transition-colors text-sm font-medium"
-                        >
-                          <RefreshCw className={`w-4 h-4 ${item.loading ? 'animate-spin' : ''}`} />
-                          Refresh
-                        </button>
-                      </div>
+            {/* Normalized Data View */}
+            {showNormalization ? (
+              <div className="bg-white rounded-2xl shadow-lg overflow-hidden">
+                <div className="bg-gradient-to-r from-purple-500 to-indigo-600 px-6 py-4">
+                  <div className="flex items-center gap-3">
+                    <div className="w-10 h-10 bg-white/20 rounded-lg flex items-center justify-center">
+                      <Users className="w-5 h-5 text-white" />
+                    </div>
+                    <div>
+                      <h2 className="text-xl font-bold text-white">Data Ternormalisasi</h2>
+                      <p className="text-white/80 text-sm">Informasi penerima paket yang sudah dinormalisasi</p>
                     </div>
                   </div>
+                </div>
 
-                  {/* Content */}
+                <div className="overflow-x-auto">
+                  <table className="w-full">
+                    <thead className="bg-gray-50 border-b">
+                      <tr>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">No Resi</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Penerima Resi</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Penerima Paket</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status Penerima</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kategori</th>
+                        <th className="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Lokasi</th>
+                      </tr>
+                    </thead>
+                    <tbody className="bg-white divide-y divide-gray-200">
+                      {normalizedData.map((item, index) => (
+                        <tr key={index} className="hover:bg-gray-50">
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-mono font-medium text-gray-900">
+                            {item.noResi}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900">
+                            {item.penerimaResi}
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">
+                            {item.penerimaPaket}
+                          </td>
+                          <td className="px-6 py-4 text-sm text-gray-900">
+                            <div className="max-w-xs truncate" title={item.statusPenerima}>
+                              {item.statusPenerima}
+                            </div>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap">
+                            <span className={`inline-flex px-2 py-1 text-xs font-semibold rounded-full ${
+                              item.kategoriPenerima === 'Penerima Langsung' ? 'bg-green-100 text-green-800' :
+                              item.kategoriPenerima === 'Keluarga/Serumah' ? 'bg-blue-100 text-blue-800' :
+                              item.kategoriPenerima === 'Keluarga' ? 'bg-blue-100 text-blue-800' :
+                              item.kategoriPenerima === 'Tetangga/Sekitar' ? 'bg-yellow-100 text-yellow-800' :
+                              item.kategoriPenerima === 'Rekan Kerja' ? 'bg-purple-100 text-purple-800' :
+                              'bg-red-100 text-red-800'
+                            }`}>
+                              {item.kategoriPenerima}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                            {item.lokasi}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            ) : (
+              /* Original Tracking Results View */
+              <div className="space-y-4">
+                {resiList.map((item, index) => (
+                  <div key={index} className="bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-100 hover:shadow-xl transition-shadow">
+                    {/* Header */}
+                    <div className="bg-gradient-to-r from-orange-500 to-red-500 px-6 py-4">
+                      <div className="flex items-center justify-between">
+                        <div className="flex items-center gap-3">
+                          <div className="w-10 h-10 bg-white/20 rounded-lg flex items-center justify-center">
+                            <Truck className="w-5 h-5 text-white" />
+                          </div>
+                          <div>
+                            <p className="text-white/80 text-xs font-medium mb-1">Nomor Resi</p>
+                            <p className="font-mono font-bold text-lg text-white">{item.resi}</p>
+                          </div>
+                        </div>
+                        
+                        <div className="flex items-center gap-2">
+                          <button
+                            onClick={() => copyResi(item.resi)}
+                            className="p-2 bg-white/20 hover:bg-white/30 rounded-lg transition-colors"
+                            title="Copy"
+                          >
+                            {copied === item.resi ? (
+                              <Check className="w-4 h-4 text-white" />
+                            ) : (
+                              <Copy className="w-4 h-4 text-white" />
+                            )}
+                          </button>
+                          <button
+                            onClick={() => trackSingleResi(item.resi)}
+                            disabled={item.loading || !API_KEY}
+                            className="px-4 py-2 bg-white/20 hover:bg-white/30 disabled:bg-white/10 text-white rounded-lg flex items-center gap-2 transition-colors text-sm font-medium"
+                          >
+                            <RefreshCw className={`w-4 h-4 ${item.loading ? 'animate-spin' : ''}`} />
+                            Refresh
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+
+                     {/* Content */}
                   <div className="p-6">
                     {item.loading && (
                       <div className="text-center py-12">
@@ -538,6 +752,7 @@ export default function PosTrackingSystem() {
                 </div>
               ))}
             </div>
+            )}
           </div>
         )}
 
