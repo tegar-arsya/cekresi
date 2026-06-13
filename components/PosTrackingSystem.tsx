@@ -1,8 +1,8 @@
 // app/page.tsx
 'use client';
 
-import { useState } from 'react';
-import { Package, Search, Loader2, CheckCircle, XCircle, Clock, Copy, Check, Download, Truck, MapPin, User, Calendar, RefreshCw, FileText, Users } from 'lucide-react';
+import { useMemo, useState } from 'react';
+import { Package, Search, Loader2, CheckCircle, XCircle, Copy, Check, Download, FileText, Users } from 'lucide-react';
 import * as XLSX from 'xlsx';
 
 interface TrackingHistory {
@@ -14,6 +14,9 @@ interface TrackingHistory {
 interface TrackingData {
   status: number;
   message: string;
+  retryable?: boolean;
+  cached?: boolean;
+  attempts?: number;
   data: {
     summary: {
       awb: string;
@@ -41,6 +44,8 @@ interface ResiItem {
   loading: boolean;
   error: string | null;
   lastUpdated: string | null;
+  durationMs: number | null;
+  retryable: boolean;
 }
 
 interface NormalizedData {
@@ -53,7 +58,28 @@ interface NormalizedData {
   tanggal: string;
 }
 
-const API_KEY = process.env.NEXT_PUBLIC_BINDERBYTE_API_KEY;
+const TRACKING_CONCURRENCY = 5;
+const TRACKING_TIMEOUT_MS = 70000;
+const FINAL_RETRY_CONCURRENCY = 2;
+const FINAL_RETRY_DELAY_MS = 5000;
+const TRACKING_CACHE_PREFIX = 'pos-tracking-cache';
+const IN_PROCESS_CACHE_TTL_MS = 10 * 60 * 1000;
+const DELIVERED_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+type CachedTrackingData = {
+  expiresAt: number;
+  data: TrackingData;
+};
+
+class TrackingError extends Error {
+  retryable: boolean;
+
+  constructor(message: string, retryable = false) {
+    super(message);
+    this.name = 'TrackingError';
+    this.retryable = retryable;
+  }
+}
 
 export default function PosTrackingSystem() {
   const [resiNumbers, setResiNumbers] = useState<string>('');
@@ -62,27 +88,103 @@ export default function PosTrackingSystem() {
   const [copied, setCopied] = useState<string | null>(null);
   const [showNormalization, setShowNormalization] = useState<boolean>(false);
 
-  const trackResi = async (resi: string): Promise<TrackingData> => {
-    if (!API_KEY) {
-      throw new Error('API Key tidak ditemukan');
+  const getTrackingCacheKey = (resi: string) => `${TRACKING_CACHE_PREFIX}:${resi}`;
+
+  const getTrackingCacheTtl = (data: TrackingData) => {
+    if (data.data?.summary?.status?.toUpperCase() === 'DELIVERED') {
+      return DELIVERED_CACHE_TTL_MS;
     }
 
-    const response = await fetch(
-      `https://api.binderbyte.com/v1/track?api_key=${API_KEY}&courier=pos&awb=${resi}`
-    );
+    return IN_PROCESS_CACHE_TTL_MS;
+  };
+
+  const readCachedTrackingData = (resi: string) => {
+    try {
+      const rawCache = window.localStorage.getItem(getTrackingCacheKey(resi));
+
+      if (!rawCache) {
+        return null;
+      }
+
+      const cached = JSON.parse(rawCache) as CachedTrackingData;
+
+      if (Date.now() > cached.expiresAt) {
+        window.localStorage.removeItem(getTrackingCacheKey(resi));
+        return null;
+      }
+
+      return {
+        ...cached.data,
+        cached: true,
+        retryable: false
+      };
+    } catch {
+      window.localStorage.removeItem(getTrackingCacheKey(resi));
+      return null;
+    }
+  };
+
+  const writeCachedTrackingData = (resi: string, data: TrackingData) => {
+    try {
+      const cached: CachedTrackingData = {
+        expiresAt: Date.now() + getTrackingCacheTtl(data),
+        data: {
+          ...data,
+          cached: false,
+          retryable: false
+        }
+      };
+
+      window.localStorage.setItem(getTrackingCacheKey(resi), JSON.stringify(cached));
+    } catch {
+      // Ignore cache storage failures so tracking still works in private/limited storage.
+    }
+  };
+
+  const trackResi = async (resi: string): Promise<TrackingData> => {
+    const cached = readCachedTrackingData(resi);
+
+    if (cached) {
+      return cached;
+    }
+
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), TRACKING_TIMEOUT_MS);
+
+    let response: Response;
+    try {
+      response = await fetch(
+        `/api/track?awb=${encodeURIComponent(resi)}`,
+        { signal: controller.signal }
+      );
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new TrackingError(`Timeout setelah ${TRACKING_TIMEOUT_MS / 1000} detik`, true);
+      }
+
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
     
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`);
+      throw new TrackingError(`HTTP error! status: ${response.status}`, response.status === 429 || response.status >= 500);
     }
     
     const data = await response.json();
     
     if (data.status !== 200 && data.status !== 201) {
-      throw new Error(data.message || 'Gagal mengambil data tracking');
+      throw new TrackingError(data.message || 'Gagal mengambil data tracking', Boolean(data.retryable));
     }
+
+    writeCachedTrackingData(resi, data);
     
     return data;
   };
+
+  const getErrorMessage = (error: unknown) => (
+    error instanceof Error ? error.message : 'Gagal mengambil data'
+  );
 
   // Fungsi untuk mengekstrak informasi penerima paket dari status terakhir
   const extractReceiverInfo = (historyDesc: string) => {
@@ -165,15 +267,10 @@ export default function PosTrackingSystem() {
       return;
     }
 
-    if (!API_KEY) {
-      alert('API Key tidak ditemukan. Silakan cek konfigurasi environment variables.');
-      return;
-    }
-
-    const resiArray = resiNumbers
+    const resiArray = Array.from(new Set(resiNumbers
       .split(/[\n,]+/)
-      .map(r => r.trim())
-      .filter(r => r.length > 0 && r.startsWith('P'));
+      .map(r => r.trim().toUpperCase())
+      .filter(r => r.length > 0 && r.startsWith('P'))));
 
     if (resiArray.length === 0) {
       alert('Tidak ada nomor resi yang valid');
@@ -183,94 +280,94 @@ export default function PosTrackingSystem() {
     const newResiList: ResiItem[] = resiArray.map(resi => ({
       resi,
       data: null,
-      loading: false,
+      loading: true,
       error: null,
-      lastUpdated: null
+      lastUpdated: null,
+      durationMs: null,
+      retryable: false
     }));
 
     setResiList(newResiList);
     setIsTracking(true);
     setShowNormalization(false); // Reset normalization view
 
-    for (let i = 0; i < newResiList.length; i++) {
-      const resi = newResiList[i].resi;
-      
-      setResiList(prev => prev.map(item => 
-        item.resi === resi ? { ...item, loading: true, error: null } : item
-      ));
-
-      try {
-        const data = await trackResi(resi);
-        
-        setResiList(prev => prev.map(item => 
-          item.resi === resi ? { 
-            ...item, 
-            data, 
-            loading: false, 
-            error: null,
-            lastUpdated: new Date().toISOString()
-          } : item
-        ));
-      } catch (error) {
-        console.error(`Error tracking ${resi}:`, error);
-        setResiList(prev => prev.map(item => 
-          item.resi === resi ? { 
-            ...item, 
-            data: null, 
-            loading: false, 
-            error: error instanceof Error ? error.message : 'Gagal mengambil data',
-            lastUpdated: new Date().toISOString()
-          } : item
-        ));
-      }
-
-      if (i < newResiList.length - 1) {
-        await new Promise(resolve => setTimeout(resolve, 1000));
-      }
-    }
-
-    setIsTracking(false);
-  };
-
-  const trackSingleResi = async (resi: string) => {
-    if (!API_KEY) {
-      alert('API Key tidak ditemukan');
-      return;
-    }
-
-    setResiList(prev => prev.map(item => 
-      item.resi === resi ? { ...item, loading: true, error: null } : item
-    ));
-
     try {
-      const data = await trackResi(resi);
-      setResiList(prev => prev.map(item => 
-        item.resi === resi ? { 
-          ...item, 
-          data, 
-          loading: false, 
-          error: null,
-          lastUpdated: new Date().toISOString()
-        } : item
-      ));
-    } catch (error) {
-      console.error(`Error tracking ${resi}:`, error);
-      setResiList(prev => prev.map(item => 
-        item.resi === resi ? { 
-          ...item, 
-          data: null, 
-          loading: false, 
-          error: error instanceof Error ? error.message : 'Gagal mengambil data',
-          lastUpdated: new Date().toISOString()
-        } : item
-      ));
-    }
-  };
+      const retryIndexes: number[] = [];
 
-  const copyResi = (resi: string) => {
-    navigator.clipboard.writeText(resi);
-    setCopied(resi);
-    setTimeout(() => setCopied(null), 2000);
+      const updateResult = (index: number, updates: Partial<Omit<ResiItem, 'resi'>>) => {
+        setResiList(prev => prev.map((item, itemIndex) => (
+          itemIndex === index ? { ...item, ...updates } : item
+        )));
+      };
+
+      const processIndexes = async (indexes: number[], concurrency: number, retrying = false) => {
+        let nextIndex = 0;
+        const workerCount = Math.min(concurrency, indexes.length);
+
+        const worker = async () => {
+          while (nextIndex < indexes.length) {
+            const currentIndex = indexes[nextIndex];
+            nextIndex += 1;
+
+            const resi = resiArray[currentIndex];
+            updateResult(currentIndex, {
+              loading: true,
+              error: null,
+              retryable: false
+            });
+
+            const startedAt = performance.now();
+
+            try {
+              const data = await trackResi(resi);
+              const durationMs = Math.round(performance.now() - startedAt);
+              console.info(`Tracking ${resi} selesai dalam ${durationMs}ms`);
+              updateResult(currentIndex, {
+                data,
+                loading: false,
+                error: null,
+                lastUpdated: new Date().toISOString(),
+                durationMs,
+                retryable: false
+              });
+            } catch (error) {
+              const durationMs = Math.round(performance.now() - startedAt);
+              const retryable = error instanceof TrackingError && error.retryable;
+              console.warn(`Tracking ${resi} gagal dalam ${durationMs}ms: ${getErrorMessage(error)}`);
+
+              if (retryable && !retrying) {
+                retryIndexes.push(currentIndex);
+              }
+
+              updateResult(currentIndex, {
+                data: null,
+                loading: false,
+                error: getErrorMessage(error),
+                lastUpdated: new Date().toISOString(),
+                durationMs,
+                retryable
+              });
+            }
+          }
+        };
+
+        await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      };
+
+      await processIndexes(
+        resiArray.map((_, index) => index),
+        TRACKING_CONCURRENCY
+      );
+
+      if (retryIndexes.length > 0) {
+        await new Promise(resolve => window.setTimeout(resolve, FINAL_RETRY_DELAY_MS));
+        await processIndexes(retryIndexes, FINAL_RETRY_CONCURRENCY, true);
+      }
+    } catch (error) {
+      console.error('Error tracking batch:', error);
+    } finally {
+      setIsTracking(false);
+    }
   };
 
   const copyAllResi = () => {
@@ -287,11 +384,12 @@ export default function PosTrackingSystem() {
           'No Resi': item.resi,
           'Penerima': '-',
           'Status Terakhir': '-',
-          'Pesan Error': item.error || 'Data tidak ditemukan'
+          'Pesan Error': item.error || 'Data tidak ditemukan',
+          'Waktu Respons': item.durationMs ? `${(item.durationMs / 1000).toFixed(2)} detik` : '-'
         };
       }
 
-      const { summary, detail } = item.data.data;
+      const { detail } = item.data.data;
       const latestHistory = item.data.data.history && item.data.data.history.length > 0 
         ? item.data.data.history[0] 
         : null;
@@ -300,7 +398,8 @@ export default function PosTrackingSystem() {
         'No Resi': item.resi,
         'Penerima': detail.receiver,
         'Status Terakhir': latestHistory ? latestHistory.desc : '-',
-        'Pesan Error': ''
+        'Pesan Error': '',
+        'Waktu Respons': item.durationMs ? `${(item.durationMs / 1000).toFixed(2)} detik` : '-'
       };
     });
 
@@ -309,7 +408,7 @@ export default function PosTrackingSystem() {
     XLSX.utils.book_append_sheet(workbook, worksheet, 'Tracking POS');
     
     const colWidths = [
-      { wch: 15 }, { wch: 25 }, { wch: 60 }, { wch: 30 },
+      { wch: 15 }, { wch: 25 }, { wch: 60 }, { wch: 30 }, { wch: 18 },
     ];
     worksheet['!cols'] = colWidths;
 
@@ -347,15 +446,31 @@ export default function PosTrackingSystem() {
     setShowNormalization(false);
   };
 
-  const successfulTrackings = resiList.filter(item => item.data?.status === 200).length;
-  const failedTrackings = resiList.filter(item => item.data?.status !== 200 || item.error).length;
+  const successfulTrackings = useMemo(
+    () => resiList.filter(item => item.data?.status === 200).length,
+    [resiList]
+  );
+  const failedTrackings = useMemo(
+    () => resiList.filter(item => !item.loading && (item.data?.status !== 200 || item.error)).length,
+    [resiList]
+  );
+  const pendingTrackings = useMemo(
+    () => resiList.filter(item => item.loading).length,
+    [resiList]
+  );
+  const averageDurationMs = useMemo(() => {
+    const completedDurations = resiList
+      .map(item => item.durationMs)
+      .filter((duration): duration is number => typeof duration === 'number');
 
-  const getLatestHistory = (item: ResiItem) => {
-    if (!item.data?.data?.history || item.data.data.history.length === 0) {
+    if (completedDurations.length === 0) {
       return null;
     }
-    return item.data.data.history[0];
-  };
+
+    return Math.round(
+      completedDurations.reduce((total, duration) => total + duration, 0) / completedDurations.length
+    );
+  }, [resiList]);
 
   const normalizedData = generateNormalizedData();
 
@@ -373,13 +488,6 @@ export default function PosTrackingSystem() {
           <p className="text-lg text-gray-600 max-w-2xl mx-auto">
             Lacak multiple paket secara real-time dengan integrasi API BinderByte
           </p>
-          {!API_KEY && (
-            <div className="mt-4 p-4 bg-red-100 border-l-4 border-red-500 rounded-lg max-w-md mx-auto">
-              <p className="text-red-700 text-sm font-medium">
-                ⚠️ API Key tidak ditemukan. Silakan set NEXT_PUBLIC_BINDERBYTE_API_KEY di environment variables.
-              </p>
-            </div>
-          )}
         </div>
 
         {/* Input Card */}
@@ -405,13 +513,13 @@ export default function PosTrackingSystem() {
           <div className="flex gap-3 mt-4">
             <button
               onClick={processResi}
-              disabled={isTracking || !API_KEY}
+              disabled={isTracking}
               className="flex-1 bg-gradient-to-r from-orange-500 to-red-500 hover:from-orange-600 hover:to-red-600 disabled:from-gray-300 disabled:to-gray-400 text-white font-semibold py-4 px-6 rounded-xl flex items-center justify-center gap-2 transition-all shadow-lg hover:shadow-xl disabled:shadow-none"
             >
               {isTracking ? (
                 <>
                   <Loader2 className="w-5 h-5 animate-spin" />
-                  Tracking {resiList.filter(item => item.loading).length}/{resiList.length}
+                  Tracking {resiList.length - pendingTrackings}/{resiList.length}
                 </>
               ) : (
                 <>
@@ -593,165 +701,26 @@ export default function PosTrackingSystem() {
                 </div>
               </div>
             ) : (
-              /* Original Tracking Results View */
-              <div className="space-y-4">
-                {resiList.map((item, index) => (
-                  <div key={index} className="bg-white rounded-2xl shadow-lg overflow-hidden border border-gray-100 hover:shadow-xl transition-shadow">
-                    {/* Header */}
-                    <div className="bg-gradient-to-r from-orange-500 to-red-500 px-6 py-4">
-                      <div className="flex items-center justify-between">
-                        <div className="flex items-center gap-3">
-                          <div className="w-10 h-10 bg-white/20 rounded-lg flex items-center justify-center">
-                            <Truck className="w-5 h-5 text-white" />
-                          </div>
-                          <div>
-                            <p className="text-white/80 text-xs font-medium mb-1">Nomor Resi</p>
-                            <p className="font-mono font-bold text-lg text-white">{item.resi}</p>
-                          </div>
-                        </div>
-                        
-                        <div className="flex items-center gap-2">
-                          <button
-                            onClick={() => copyResi(item.resi)}
-                            className="p-2 bg-white/20 hover:bg-white/30 rounded-lg transition-colors"
-                            title="Copy"
-                          >
-                            {copied === item.resi ? (
-                              <Check className="w-4 h-4 text-white" />
-                            ) : (
-                              <Copy className="w-4 h-4 text-white" />
-                            )}
-                          </button>
-                          <button
-                            onClick={() => trackSingleResi(item.resi)}
-                            disabled={item.loading || !API_KEY}
-                            className="px-4 py-2 bg-white/20 hover:bg-white/30 disabled:bg-white/10 text-white rounded-lg flex items-center gap-2 transition-colors text-sm font-medium"
-                          >
-                            <RefreshCw className={`w-4 h-4 ${item.loading ? 'animate-spin' : ''}`} />
-                            Refresh
-                          </button>
-                        </div>
-                      </div>
-                    </div>
+              <div className="bg-white rounded-2xl shadow-lg border border-gray-100 p-6">
+                <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">
+                  <div>
+                    <h2 className="text-lg font-semibold text-gray-900">Detail kartu disembunyikan</h2>
+                    <p className="text-sm text-gray-600">
+                      Untuk menjaga tampilan tetap ringan, detail per-resi tidak dirender. Data tetap tersimpan untuk export Excel dan normalisasi.
+                    </p>
+                  </div>
 
-                     {/* Content */}
-                  <div className="p-6">
-                    {item.loading && (
-                      <div className="text-center py-12">
-                        <Loader2 className="w-8 h-8 animate-spin text-orange-500 mx-auto mb-3" />
-                        <p className="text-gray-600 font-medium">Memuat data tracking...</p>
-                      </div>
-                    )}
-
-                    {item.error && (
-                      <div className="bg-red-50 border-l-4 border-red-500 rounded-lg p-4">
-                        <div className="flex items-center gap-3">
-                          <XCircle className="w-5 h-5 text-red-500 flex-shrink-0" />
-                          <div>
-                            <p className="font-semibold text-red-900">Error</p>
-                            <p className="text-sm text-red-700">{item.error}</p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
-
-                    {item.data && item.data.status === 200 && item.data.data && (
-                      <div className="space-y-6">
-                        {/* Status Badge */}
-                        <div className="flex items-center gap-3">
-                          <div className={`px-4 py-2 rounded-full font-semibold text-sm ${
-                            item.data.data.summary.status === 'DELIVERED'
-                              ? 'bg-green-100 text-green-700'
-                              : 'bg-orange-100 text-orange-700'
-                          }`}>
-                            {item.data.data.summary.status}
-                          </div>
-                          <div className="text-sm text-gray-500 flex items-center gap-2">
-                            <Calendar className="w-4 h-4" />
-                            {item.data.data.summary.date}
-                          </div>
-                        </div>
-
-                        {/* Info Grid */}
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                          <div className="bg-gradient-to-br from-blue-50 to-blue-100/50 rounded-xl p-5 border border-blue-200">
-                            <div className="flex items-center gap-2 mb-3">
-                              <div className="w-8 h-8 bg-blue-500 rounded-lg flex items-center justify-center">
-                                <Truck className="w-4 h-4 text-white" />
-                              </div>
-                              <h3 className="font-semibold text-gray-900">Informasi Pengiriman</h3>
-                            </div>
-                            <div className="space-y-2 text-sm">
-                              <div className="flex justify-between">
-                                <span className="text-gray-600">Layanan</span>
-                                <span className="font-semibold text-gray-900">{item.data.data.summary.service}</span>
-                              </div>
-                              <div className="flex justify-between">
-                                <span className="text-gray-600">Berat</span>
-                                <span className="font-semibold text-gray-900">{item.data.data.summary.weight}</span>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="bg-gradient-to-br from-purple-50 to-purple-100/50 rounded-xl p-5 border border-purple-200">
-                            <div className="flex items-center gap-2 mb-3">
-                              <div className="w-8 h-8 bg-purple-500 rounded-lg flex items-center justify-center">
-                                <User className="w-4 h-4 text-white" />
-                              </div>
-                              <h3 className="font-semibold text-gray-900">Informasi Pihak</h3>
-                            </div>
-                            <div className="space-y-2 text-sm">
-                              <div className="flex justify-between items-start">
-                                <span className="text-gray-600">Pengirim</span>
-                                <span className="font-semibold text-gray-900 text-right">{item.data.data.detail.shipper}</span>
-                              </div>
-                              <div className="flex justify-between items-start">
-                                <span className="text-gray-600">Penerima</span>
-                                <span className="font-semibold text-gray-900 text-right">{item.data.data.detail.receiver}</span>
-                              </div>
-                            </div>
-                          </div>
-                        </div>
-
-                        {/* Latest Status Only */}
-                        {getLatestHistory(item) && (
-                          <div className="bg-gradient-to-br from-orange-50 to-orange-100/50 rounded-xl p-5 border border-orange-200">
-                            <div className="flex items-center gap-2 mb-4">
-                              <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center">
-                                <Clock className="w-4 h-4 text-white" />
-                              </div>
-                              <h3 className="font-semibold text-gray-900">Status Terbaru</h3>
-                            </div>
-                            <div className="bg-white rounded-lg p-4 shadow-sm border border-orange-200">
-                              <div className="flex items-start justify-between mb-2">
-                                <p className="font-semibold text-gray-900 text-sm">{getLatestHistory(item)?.date}</p>
-                                <div className="flex items-center gap-1 text-xs text-gray-500">
-                                  <MapPin className="w-3 h-3" />
-                                  {getLatestHistory(item)?.location}
-                                </div>
-                              </div>
-                              <p className="text-sm text-gray-700">{getLatestHistory(item)?.desc}</p>
-                            </div>
-                          </div>
-                        )}
-                      </div>
-                    )}
-
-                    {item.data && item.data.status !== 200 && (
-                      <div className="bg-yellow-50 border-l-4 border-yellow-500 rounded-lg p-4">
-                        <div className="flex items-center gap-3">
-                          <Clock className="w-5 h-5 text-yellow-500 flex-shrink-0" />
-                          <div>
-                            <p className="font-semibold text-yellow-900">Data Tidak Ditemukan</p>
-                            <p className="text-sm text-yellow-700">{item.data.message}</p>
-                          </div>
-                        </div>
-                      </div>
-                    )}
+                  <div className="flex flex-wrap gap-3 text-sm text-gray-600">
+                    <span className="rounded-full bg-gray-100 px-3 py-2">Total {resiList.length}</span>
+                    <span className="rounded-full bg-blue-50 px-3 py-2 text-blue-700">Proses {pendingTrackings}</span>
+                    <span className="rounded-full bg-green-50 px-3 py-2 text-green-700">Berhasil {successfulTrackings}</span>
+                    <span className="rounded-full bg-red-50 px-3 py-2 text-red-700">Gagal {failedTrackings}</span>
+                    <span className="rounded-full bg-purple-50 px-3 py-2 text-purple-700">
+                      Rata-rata {averageDurationMs ? `${(averageDurationMs / 1000).toFixed(2)} detik` : '-'}
+                    </span>
                   </div>
                 </div>
-              ))}
-            </div>
+              </div>
             )}
           </div>
         )}
